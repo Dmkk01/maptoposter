@@ -4,3 +4,5 @@ env/
 .venv/
 .DS_Store
 .cache/*
+
+posters/*

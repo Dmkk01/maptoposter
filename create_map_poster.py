@@ -89,18 +89,36 @@ def load_fonts():
 
 FONTS = load_fonts()
 
-def generate_output_filename(city, theme_name, output_format):
+def generate_output_filename(city, theme_name, output_format, output_path=None):
     """
     Generate unique output filename with city, theme, and datetime.
+    Can accept either a directory path or a full file path.
     """
-    if not os.path.exists(POSTERS_DIR):
-        os.makedirs(POSTERS_DIR)
+    if output_path is None:
+        output_dir = POSTERS_DIR
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        city_slug = city.lower().replace(' ', '_')
+        ext = output_format.lower()
+        filename = f"{city_slug}_{theme_name}_{timestamp}.{ext}"
+        full_path = os.path.join(output_dir, filename)
+    else:
+        # Check if output_path has a file extension (is a file path)
+        if os.path.splitext(output_path)[1]:  # Has extension, treat as full file path
+            full_path = output_path
+            output_dir = os.path.dirname(output_path)
+        else:  # No extension, treat as directory
+            output_dir = output_path
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            city_slug = city.lower().replace(' ', '_')
+            ext = output_format.lower()
+            filename = f"{city_slug}_{theme_name}_{timestamp}.{ext}"
+            full_path = os.path.join(output_dir, filename)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    city_slug = city.lower().replace(' ', '_')
-    ext = output_format.lower()
-    filename = f"{city_slug}_{theme_name}_{timestamp}.{ext}"
-    return os.path.join(POSTERS_DIR, filename)
+    # Create directory if it doesn't exist
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    return full_path
 
 def get_available_themes():
     """
@@ -354,6 +372,42 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
         print(f"OSMnx error while fetching graph: {e}")
         return None
 
+def fetch_graph_from_place(place_name) -> tuple[MultiDiGraph | None, tuple[float, float] | None]:
+    """
+    Fetch graph for a large area (country, state, region) using place name.
+    Returns tuple of (graph, center_point) or (None, None) if failed.
+    """
+    graph = f"graph_place_{place_name.lower().replace(' ', '_').replace(',', '_')}"
+    cached = cache_get(graph)
+    if cached is not None:
+        print("✓ Using cached place network")
+        # Cached data is tuple of (graph, center_point)
+        return cast(tuple[MultiDiGraph, tuple[float, float]], cached)
+
+    try:
+        print(f"Downloading map data for: {place_name}")
+        print("⚠ Note: Large areas may take several minutes to download...")
+        G = ox.graph_from_place(place_name, network_type='all', truncate_by_edge=True)
+        
+        # Calculate center point from the graph's bounding box
+        nodes = ox.graph_to_gdfs(G, edges=False)
+        center_lat = (nodes['y'].min() + nodes['y'].max()) / 2
+        center_lon = (nodes['x'].min() + nodes['x'].max()) / 2
+        center_point = (center_lat, center_lon)
+        
+        # Rate limit between requests
+        time.sleep(0.5)
+        try:
+            cache_set(graph, (G, center_point))
+        except CacheError as e:
+            print(e)
+        return G, center_point
+    except Exception as e:
+        print(f"OSMnx error while fetching place graph: {e}")
+        print("Tip: Make sure the place name is recognizable by OpenStreetMap")
+        print("Examples: 'Netherlands', 'Manhattan, New York', 'Île-de-France, France'")
+        return None, None
+
 def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
     lat, lon = point
     tag_str = "_".join(tags.keys())
@@ -376,29 +430,77 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
         print(f"OSMnx error while fetching features: {e}")
         return None
 
+def fetch_features_from_place(place_name, tags, name) -> GeoDataFrame | None:
+    """
+    Fetch geographic features (water, parks) for a large area using place name.
+    """
+    tag_str = "_".join(tags.keys())
+    features = f"{name}_place_{place_name.lower().replace(' ', '_').replace(',', '_')}_{tag_str}"
+    cached = cache_get(features)
+    if cached is not None:
+        print(f"✓ Using cached {name}")
+        return cached
+
+    try:
+        data = ox.features_from_place(place_name, tags=tags)
+        # Rate limit between requests
+        time.sleep(0.3)
+        try:
+            cache_set(features, data)
+        except CacheError as e:
+            print(e)
+        return data
+    except Exception as e:
+        print(f"OSMnx error while fetching {name} features: {e}")
+        return None
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None):
-    print(f"\nGenerating map for {city}, {country}...")
+
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, place_name=None):
+    """
+    Create a map poster. Can use either:
+    - point + dist for radius-based maps
+    - place_name for bounding box maps (countries, regions)
+    """
+    if place_name:
+        print(f"\nGenerating map for {place_name}...")
+    else:
+        print(f"\nGenerating map for {city}, {country}...")
     
     # Progress bar for data fetching
     with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
-        compensated_dist = dist * (max(height, width) / min(height, width))/4 # To compensate for viewport crop
-        G = fetch_graph(point, compensated_dist)
-        if G is None:
-            raise RuntimeError("Failed to retrieve street network data.")
+        
+        if place_name:
+            # Use place-based fetching for large areas
+            G, center_point = fetch_graph_from_place(place_name)
+            if G is None:
+                raise RuntimeError("Failed to retrieve street network data for place.")
+            # Override point with calculated center
+            point = center_point
+        else:
+            # Use point + radius for smaller areas
+            compensated_dist = dist * (max(height, width) / min(height, width))/4
+            G = fetch_graph(point, compensated_dist)
+            if G is None:
+                raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
         
         # 2. Fetch Water Features
         pbar.set_description("Downloading water features")
-        water = fetch_features(point, compensated_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
+        if place_name:
+            water = fetch_features_from_place(place_name, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
+        else:
+            water = fetch_features(point, compensated_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
         pbar.update(1)
         
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(point, compensated_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
+        if place_name:
+            parks = fetch_features_from_place(place_name, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
+        else:
+            parks = fetch_features(point, compensated_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
         pbar.update(1)
     
     print("✓ All data retrieved successfully!")
@@ -442,7 +544,36 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     edge_widths = get_edge_widths_by_type(G_proj)
 
     # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, compensated_dist)
+    if place_name:
+        # For place-based maps, adjust bounding box to match figure aspect ratio
+        nodes = ox.graph_to_gdfs(G_proj, edges=False)
+        data_x_min, data_x_max = nodes.geometry.x.min(), nodes.geometry.x.max()
+        data_y_min, data_y_max = nodes.geometry.y.min(), nodes.geometry.y.max()
+        
+        # Calculate the data's dimensions
+        data_width = data_x_max - data_x_min
+        data_height = data_y_max - data_y_min
+        data_aspect = data_width / data_height
+        
+        # Figure aspect ratio
+        fig_aspect = width / height
+        
+        # Adjust limits to match figure aspect while containing all data
+        if data_aspect > fig_aspect:
+            # Data is wider than figure - expand height
+            data_center_y = (data_y_min + data_y_max) / 2
+            new_height = data_width / fig_aspect
+            crop_xlim = (data_x_min, data_x_max)
+            crop_ylim = (data_center_y - new_height/2, data_center_y + new_height/2)
+        else:
+            # Data is taller than figure - expand width
+            data_center_x = (data_x_min + data_x_max) / 2
+            new_width = data_height * fig_aspect
+            crop_xlim = (data_center_x - new_width/2, data_center_x + new_width/2)
+            crop_ylim = (data_y_min, data_y_max)
+    else:
+        # For point-based maps, use the compensated distance
+        crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, compensated_dist)
     # Plot the projected graph and then apply the cropped limits
     ox.plot_graph(
         G_proj, ax=ax, bgcolor=THEME['bg'],
@@ -545,6 +676,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     plt.savefig(output_file, format=fmt, **save_kwargs)
 
     plt.close()
+    
+    # Print the absolute path for programmatic capture
+    print(f"OUTPUT_FILE: {os.path.abspath(output_file)}")
     print(f"✓ Done! Poster saved as {output_file}")
 
 
@@ -556,6 +690,7 @@ City Map Poster Generator
 
 Usage:
   python create_map_poster.py --city <city> --country <country> [options]
+  python create_map_poster.py --lat <latitude> --lon <longitude> [options]
 
 Examples:
   # Iconic grid patterns
@@ -585,16 +720,37 @@ Examples:
   python create_map_poster.py -c "London" -C "UK" -t noir -d 15000              # Thames curves
   python create_map_poster.py -c "Budapest" -C "Hungary" -t copper_patina -d 8000  # Danube split
   
+  # Using custom coordinates
+  python create_map_poster.py --lat 52.3676 --lon 4.9041 --city-label "Amsterdam" --country-label "Netherlands" -t japanese_ink -d 15000
+  python create_map_poster.py --lat 40.7580 --lon -73.9855 --city-label "Times Square" -t neon_cyberpunk -d 5000
+  python create_map_poster.py --lat 51.5074 --lon -0.1278 -t noir -d 10000  # Will show "CUSTOM LOCATION"
+  
+  # Countries, states, and large areas (uses bounding box, ignores --distance)
+  python create_map_poster.py --place "Singapore" -t ocean              # Entire country
+  python create_map_poster.py -p "Manhattan, New York" -t noir          # Borough
+  python create_map_poster.py -p "Île-de-France, France" -t pastel_dream  # Region
+  python create_map_poster.py -p "Netherlands" --city-label "Nederland" -t blueprint  # With custom label
+  
+  # Using custom output path
+  python create_map_poster.py -c "Amsterdam" -C "Netherlands" -t japanese_ink -o "/path/to/output/amsterdam.png"
+  python create_map_poster.py -c "Paris" -C "France" -t pastel_dream -o "./my_maps/"  # Directory only
+  
   # List themes
   python create_map_poster.py --list-themes
 
 Options:
-  --city, -c        City name (required)
-  --country, -C     Country name (required)
+  --city, -c        City name (use with --country, or omit if using --lat/--lon or --place)
+  --country, -C     Country name (use with --city, or omit if using --lat/--lon or --place)
+  --place, -p       Place name for large areas: countries, states, regions, boroughs
+                    (alternative to --city/--country or --lat/--lon, uses bounding box)
+  --lat             Latitude coordinate (use with --lon instead of --city/--country)
+  --lon             Longitude coordinate (use with --lat instead of --city/--country)
+  --city-label      Override city text displayed on poster
   --country-label   Override country text displayed on poster
   --theme, -t       Theme name (default: feature_based)
   --all-themes      Generate posters for all themes
-  --distance, -d    Map radius in meters (default: 29000)
+  --distance, -d    Map radius in meters (default: 29000, ignored when using --place)
+  --output, -o      Output path: directory or full file path
   --list-themes     List all available themes
 
 Distance guide:
@@ -646,6 +802,10 @@ Examples:
     
     parser.add_argument('--city', '-c', type=str, help='City name')
     parser.add_argument('--country', '-C', type=str, help='Country name')
+    parser.add_argument('--place', '-p', type=str, help='Place name for large areas (e.g., "Netherlands", "Manhattan, New York") - alternative to city/country or lat/lon')
+    parser.add_argument('--lat', type=float, help='Latitude (use with --lon instead of --city/--country)')
+    parser.add_argument('--lon', type=float, help='Longitude (use with --lat instead of --city/--country)')
+    parser.add_argument('--city-label', dest='city_label', type=str, help='Override city text displayed on poster')
     parser.add_argument('--country-label', dest='country_label', type=str, help='Override country text displayed on poster')
     parser.add_argument('--theme', '-t', type=str, default='feature_based', help='Theme name (default: feature_based)')
     parser.add_argument('--all-themes', '--All-themes', dest='all_themes', action='store_true', help='Generate posters for all themes')
@@ -654,6 +814,7 @@ Examples:
     parser.add_argument('--height', '-H', type=float, default=16, help='Image height in inches (default: 16)')
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
     parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
+    parser.add_argument('--output', '-o', type=str, help='Output path: directory (e.g., ./maps/) or full file path (e.g., ./maps/my_map.png)')
     
     args = parser.parse_args()
     
@@ -667,10 +828,27 @@ Examples:
         list_themes()
         sys.exit(0)
     
-    # Validate required arguments
-    if not args.city or not args.country:
-        print("Error: --city and --country are required.\n")
+    # Validate required arguments: either (city + country) OR (lat + lon) OR (place)
+    has_city_country = bool(args.city and args.country)
+    has_lat_lon = bool(args.lat is not None and args.lon is not None)
+    has_place = bool(args.place is not None)
+    
+    if not has_city_country and not has_lat_lon and not has_place:
+        print("Error: Either (--city and --country) OR (--lat and --lon) OR (--place) are required.\n")
         print_examples()
+        sys.exit(1)
+    
+    if sum([has_city_country, has_lat_lon, has_place]) > 1:
+        print("Error: Use only ONE of: (--city + --country), (--lat + --lon), or (--place).\n")
+        print_examples()
+        sys.exit(1)
+    
+    if has_lat_lon and (args.lat < -90 or args.lat > 90):
+        print("Error: Latitude must be between -90 and 90.")
+        sys.exit(1)
+    
+    if has_lat_lon and (args.lon < -180 or args.lon > 180):
+        print("Error: Longitude must be between -180 and 180.")
         sys.exit(1)
     
     available_themes = get_available_themes()
@@ -693,11 +871,34 @@ Examples:
     
     # Get coordinates and generate poster
     try:
-        coords = get_coordinates(args.city, args.country)
+        # Determine which mode we're in
+        if args.place:
+            # Place-based mode (for countries, regions, large areas)
+            coords = None  # Will be calculated from the place
+            place_name = args.place
+            display_city = args.city_label or args.place
+            display_country = args.country_label or ""
+            filename_base = args.place.replace(",", "").replace(" ", "_").lower()
+        elif args.lat is not None and args.lon is not None:
+            # Custom coordinates mode
+            coords = (args.lat, args.lon)
+            place_name = None
+            print(f"✓ Using custom coordinates: {args.lat}, {args.lon}")
+            display_city = args.city_label or args.city or "CUSTOM LOCATION"
+            display_country = args.country_label or args.country or ""
+            filename_base = args.city or "custom"
+        else:
+            # City/country geocoding mode
+            coords = get_coordinates(args.city, args.country)
+            place_name = None
+            display_city = args.city_label or args.city
+            display_country = args.country_label or args.country
+            filename_base = args.city
+        
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
-            output_file = generate_output_filename(args.city, theme_name, args.format)
-            create_poster(args.city, args.country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label)
+            output_file = generate_output_filename(filename_base, theme_name, args.format, output_path=args.output)
+            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
