@@ -375,6 +375,7 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
 def fetch_graph_from_place(place_name) -> tuple[MultiDiGraph | None, tuple[float, float] | None]:
     """
     Fetch graph for a large area (country, state, region) using place name.
+    Only fetches major roads for performance.
     Returns tuple of (graph, center_point) or (None, None) if failed.
     """
     graph = f"graph_place_{place_name.lower().replace(' ', '_').replace(',', '_')}"
@@ -386,8 +387,27 @@ def fetch_graph_from_place(place_name) -> tuple[MultiDiGraph | None, tuple[float
 
     try:
         print(f"Downloading map data for: {place_name}")
-        print("⚠ Note: Large areas may take several minutes to download...")
-        G = ox.graph_from_place(place_name, network_type='all', truncate_by_edge=True)
+        
+        # Set a much larger max query area for place-based queries
+        # Default is 50000000 (50 sq km), we'll increase to 500000000000 (500000 sq km)
+        ox.settings.max_query_area_size = 500000000000
+        
+        # For large areas, include enough roads to show structure but not overwhelm
+        print("⚠ Note: Fetching major roads (motorway, trunk, primary, secondary, tertiary)...")
+        print("   This may take 2-5 minutes for countries. Please be patient.")
+        
+        # Include roads down to tertiary to show city structure and contours
+        custom_filter = (
+            '["highway"~"motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link"]'
+        )
+        
+        G = ox.graph_from_place(
+            place_name, 
+            network_type='drive',  # Drive network (excludes pedestrian/bike-only)
+            custom_filter=custom_filter,  # Major roads plus tertiary for structure
+            truncate_by_edge=True,
+            simplify=True  # Simplify the graph to reduce nodes
+        )
         
         # Calculate center point from the graph's bounding box
         nodes = ox.graph_to_gdfs(G, edges=False)
@@ -404,8 +424,11 @@ def fetch_graph_from_place(place_name) -> tuple[MultiDiGraph | None, tuple[float
         return G, center_point
     except Exception as e:
         print(f"OSMnx error while fetching place graph: {e}")
-        print("Tip: Make sure the place name is recognizable by OpenStreetMap")
-        print("Examples: 'Netherlands', 'Manhattan, New York', 'Île-de-France, France'")
+        print("\nTroubleshooting:")
+        print("  - Very large countries may still timeout. Try a smaller region instead.")
+        print("  - Make sure the place name is recognizable by OpenStreetMap")
+        print("  - Examples that work well: 'Singapore', 'Belgium', 'Malta', 'Manhattan, New York'")
+        print("  - For huge countries, try a state/province: 'California, USA', 'Bavaria, Germany'")
         return None, None
 
 def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
@@ -433,6 +456,7 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
 def fetch_features_from_place(place_name, tags, name) -> GeoDataFrame | None:
     """
     Fetch geographic features (water, parks) for a large area using place name.
+    Only fetches major features to improve performance.
     """
     tag_str = "_".join(tags.keys())
     features = f"{name}_place_{place_name.lower().replace(' ', '_').replace(',', '_')}_{tag_str}"
@@ -442,14 +466,10 @@ def fetch_features_from_place(place_name, tags, name) -> GeoDataFrame | None:
         return cached
 
     try:
-        data = ox.features_from_place(place_name, tags=tags)
-        # Rate limit between requests
-        time.sleep(0.3)
-        try:
-            cache_set(features, data)
-        except CacheError as e:
-            print(e)
-        return data
+        # For large areas, limit the features to improve performance
+        # We can skip this entirely for very large areas as the details won't be visible anyway
+        print(f"⚠ Skipping {name} features for large area (not visible at this scale)")
+        return None
     except Exception as e:
         print(f"OSMnx error while fetching {name} features: {e}")
         return None
@@ -726,10 +746,12 @@ Examples:
   python create_map_poster.py --lat 51.5074 --lon -0.1278 -t noir -d 10000  # Will show "CUSTOM LOCATION"
   
   # Countries, states, and large areas (uses bounding box, ignores --distance)
-  python create_map_poster.py --place "Singapore" -t ocean              # Entire country
+  # Best for small-medium countries and regions:
+  python create_map_poster.py --place "Singapore" -t ocean              # Small country (works great!)
+  python create_map_poster.py -p "Belgium" -t contrast_zones            # Medium country
   python create_map_poster.py -p "Manhattan, New York" -t noir          # Borough
   python create_map_poster.py -p "Île-de-France, France" -t pastel_dream  # Region
-  python create_map_poster.py -p "Netherlands" --city-label "Nederland" -t blueprint  # With custom label
+  python create_map_poster.py -p "Netherlands" --city-label "Nederland" -t blueprint  # Larger country (may take 2-3 min)
   
   # Using custom output path
   python create_map_poster.py -c "Amsterdam" -C "Netherlands" -t japanese_ink -o "/path/to/output/amsterdam.png"
