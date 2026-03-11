@@ -37,10 +37,6 @@ POSTERS_DIR = "posters"
 
 CACHE_DIR = ".cache"
 
-class CacheError(Exception):
-    pass
-
-
 def _cache_path(key: str) -> str:
     safe = key.replace(os.sep, "_")
     return os.path.join(CACHE_DIR, f"{safe}.pkl")
@@ -277,7 +273,7 @@ def get_coordinates(city, country):
         return cached
 
     print("Looking up coordinates...")
-    geolocator = Nominatim(user_agent="city_map_poster", timeout=10)
+    geolocator = Nominatim(user_agent="city_map_poster")
     
     # Add a small delay to respect Nominatim's usage policy
     time.sleep(1)
@@ -330,7 +326,8 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
             to_crs=G_proj.graph["crs"]
         )[0]
     )
-    center_x, center_y = center.x, center.y
+    center_point = cast(Point, center)
+    center_x, center_y = center_point.x, center_point.y
 
     fig_width, fig_height = fig.get_size_inches()
     aspect = fig_width / fig_height
@@ -351,16 +348,94 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
     )
 
 
-def fetch_graph(point, dist) -> MultiDiGraph | None:
+def get_road_query_options(dist: float, natural_mode: bool, natural_detail: str) -> tuple[str, str | None]:
+    """Return adaptive road query settings for the requested scale."""
+    if dist >= 140000:
+        return (
+            'drive',
+            '["highway"~"motorway|trunk|primary|motorway_link|trunk_link|primary_link"]',
+        )
+
+    if dist >= 70000:
+        return (
+            'drive',
+            '["highway"~"motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link|secondary_link"]',
+        )
+
+    if not natural_mode:
+        return 'all', None
+
+    if dist >= 180000 or natural_detail == 'low':
+        custom_filter = (
+            '["highway"~"motorway|trunk|primary|motorway_link|trunk_link|primary_link"]'
+        )
+    elif dist >= 70000:
+        custom_filter = (
+            '["highway"~"motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link|secondary_link"]'
+        )
+    elif dist >= 25000:
+        custom_filter = (
+            '["highway"~"motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link"]'
+        )
+    else:
+        custom_filter = (
+            '["highway"~"motorway|trunk|primary|secondary|tertiary|unclassified|residential|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link"]'
+        )
+
+    return 'drive', custom_filter
+
+
+def get_feature_query_dist(dist: float, query_dist: float) -> float:
+    """Reduce non-road feature downloads for large-area renders."""
+    if dist >= 140000:
+        return query_dist * 0.4
+    if dist >= 70000:
+        return query_dist * 0.6
+    return query_dist
+
+
+def prune_features_for_scale(data: GeoDataFrame | None, dist: float) -> GeoDataFrame | None:
+    """Drop tiny polygons and short lines that add clutter at large scales."""
+    if data is None or data.empty:
+        return data
+
+    try:
+        projected = ox.projection.project_gdf(data)
+    except Exception:
+        return data
+
+    min_area = max(2500.0, (dist / 80.0) ** 2)
+    min_length = max(150.0, dist / 40.0)
+
+    geom_types = projected.geometry.geom_type
+    polygon_mask = geom_types.isin(['Polygon', 'MultiPolygon'])
+    line_mask = geom_types.isin(['LineString', 'MultiLineString'])
+    other_mask = ~(polygon_mask | line_mask)
+
+    keep_mask = other_mask.copy()
+    keep_mask.loc[polygon_mask] = projected.loc[polygon_mask].geometry.area >= min_area
+    keep_mask.loc[line_mask] = projected.loc[line_mask].geometry.length >= min_length
+
+    return cast(GeoDataFrame, data.loc[keep_mask])
+
+
+def fetch_graph(point, dist, network_type='all', custom_filter=None, cache_variant='default') -> MultiDiGraph | None:
     lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
+    graph = f"graph_{lat}_{lon}_{dist}_{network_type}_{cache_variant}"
     cached = cache_get(graph)
     if cached is not None:
         print("✓ Using cached street network")
         return cast(MultiDiGraph, cached)
 
     try:
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all', truncate_by_edge=True)
+        G = ox.graph_from_point(
+            point,
+            dist=dist,
+            dist_type='bbox',
+            network_type=network_type,
+            custom_filter=custom_filter,
+            truncate_by_edge=True,
+        )
         # Rate limit between requests
         time.sleep(0.5)
         try:
@@ -474,21 +549,136 @@ def fetch_features_from_place(place_name, tags, name) -> GeoDataFrame | None:
         print(f"OSMnx error while fetching {name} features: {e}")
         return None
 
+def fetch_natural_features(point, dist, feature_type='forests', scale_dist=None) -> GeoDataFrame | None:
+    """
+    Fetch natural features like forests, grasslands, meadows, streams, trails,
+    and rugged terrain polygons.
+    Useful for natural/terrain-focused maps.
+    """
+    lat, lon = point
+    effective_scale = scale_dist if scale_dist is not None else dist
+    feature_variant = f"{feature_type}_{int(dist)}"
+    features = f"natural_{feature_variant}_{lat}_{lon}"
+    cached = cache_get(features)
+    if cached is not None:
+        print(f"✓ Using cached {feature_type}")
+        return cast(GeoDataFrame, cached)
+
+    try:
+        # Define tags based on feature type
+        tags: dict[str, bool | str | list[str]]
+        if feature_type == 'forests':
+            tags = {'natural': 'wood', 'landuse': 'forest'}
+        elif feature_type == 'grasslands':
+            if effective_scale >= 120000:
+                tags = {'natural': ['grassland', 'heath'], 'landuse': 'meadow'}
+            else:
+                tags = {'natural': ['grassland', 'heath', 'scrub'], 'landuse': ['meadow', 'grass']}
+        elif feature_type == 'water_detailed':
+            if effective_scale >= 100000:
+                tags = {'waterway': ['river', 'canal', 'riverbank'], 'natural': 'water'}
+            else:
+                tags = {'natural': 'water', 'waterway': ['river', 'stream', 'canal', 'riverbank']}
+        elif feature_type == 'trails':
+            if effective_scale >= 35000:
+                print("⚠ Skipping trails at this scale")
+                return None
+            if effective_scale >= 18000:
+                tags = {'highway': ['path', 'track']}
+            else:
+                tags = {'highway': ['path', 'track', 'footway', 'bridleway', 'cycleway', 'steps']}
+        elif feature_type == 'rugged':
+            if effective_scale >= 140000:
+                print("⚠ Skipping rugged terrain at this scale")
+                return None
+            if effective_scale >= 50000:
+                tags = {'natural': ['wetland', 'bare_rock', 'scree']}
+            else:
+                tags = {'natural': ['wetland', 'bare_rock', 'scree', 'shingle', 'sand', 'beach']}
+        else:
+            return None
+        
+        data = ox.features_from_point(point, tags=tags, dist=dist)
+        data = prune_features_for_scale(cast(GeoDataFrame, data), effective_scale)
+        # Rate limit between requests
+        time.sleep(0.3)
+        try:
+            cache_set(features, data)
+        except CacheError as e:
+            print(e)
+        return data
+    except Exception as e:
+        print(f"OSMnx error while fetching {feature_type}: {e}")
+        return None
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, place_name=None):
+def get_natural_style(detail_level: str) -> dict[str, float | bool]:
+    """Return rendering knobs for natural mode."""
+    styles: dict[str, dict[str, float | bool]] = {
+        'low': {
+            'road_alpha': 0.45,
+            'road_width_scale': 0.7,
+            'show_trails': False,
+            'show_rugged': False,
+            'forest_alpha': 0.55,
+            'grass_alpha': 0.45,
+        },
+        'medium': {
+            'road_alpha': 0.28,
+            'road_width_scale': 0.5,
+            'show_trails': True,
+            'show_rugged': False,
+            'forest_alpha': 0.68,
+            'grass_alpha': 0.55,
+        },
+        'high': {
+            'road_alpha': 0.18,
+            'road_width_scale': 0.35,
+            'show_trails': True,
+            'show_rugged': True,
+            'forest_alpha': 0.78,
+            'grass_alpha': 0.62,
+        },
+    }
+    return styles.get(detail_level, styles['medium'])
+
+
+
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, place_name=None, natural_mode=False, natural_detail='medium'):
     """
     Create a map poster. Can use either:
     - point + dist for radius-based maps
     - place_name for bounding box maps (countries, regions)
+    - natural_mode: emphasizes natural features (forests, water, terrain) instead of roads
     """
     if place_name:
         print(f"\nGenerating map for {place_name}...")
     else:
         print(f"\nGenerating map for {city}, {country}...")
     
+    if natural_mode:
+        print("🌲 Natural mode enabled - emphasizing forests, water, and terrain")
+        print(f"   Detail level: {natural_detail}")
+    if not place_name and dist >= 70000:
+        print("⚠ Large-area mode enabled - reducing downloaded detail for faster fetches")
+
+    natural_style = get_natural_style(natural_detail)
+    query_dist = dist
+    feature_query_dist = dist
+    
     # Progress bar for data fetching
-    with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+    extra_steps = 0
+    if natural_mode and not place_name:
+        extra_steps = 1
+        if dist < 70000:
+            extra_steps = 3
+            if natural_style['show_trails']:
+                extra_steps += 1
+            if natural_style['show_rugged']:
+                extra_steps += 1
+
+    total_steps = 3 + extra_steps
+    with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
         
@@ -501,8 +691,11 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             point = center_point
         else:
             # Use point + radius for smaller areas
-            compensated_dist = dist * (max(height, width) / min(height, width))/4
-            G = fetch_graph(point, compensated_dist)
+            query_dist = dist * (max(height, width) / min(height, width)) / 4
+            feature_query_dist = get_feature_query_dist(dist, query_dist)
+            network_type, custom_filter = get_road_query_options(dist, natural_mode, natural_detail)
+            cache_variant = md5(f"{network_type}|{custom_filter}".encode('utf-8')).hexdigest()[:10]
+            G = fetch_graph(point, query_dist, network_type=network_type, custom_filter=custom_filter, cache_variant=cache_variant)
             if G is None:
                 raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
@@ -512,7 +705,13 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if place_name:
             water = fetch_features_from_place(place_name, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
         else:
-            water = fetch_features(point, compensated_dist, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
+            if dist >= 70000:
+                water_tags = {'natural': 'water'}
+            else:
+                water_tags = {'natural': 'water', 'waterway': 'riverbank'}
+            water = fetch_features(point, feature_query_dist, tags=water_tags, name='water')
+            if natural_mode:
+                water = prune_features_for_scale(water, dist)
         pbar.update(1)
         
         # 3. Fetch Parks
@@ -520,8 +719,55 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if place_name:
             parks = fetch_features_from_place(place_name, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
         else:
-            parks = fetch_features(point, compensated_dist, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
+            park_tags: dict[str, bool | str | list[str]]
+            if dist >= 140000 and not natural_mode:
+                print("⚠ Skipping parks at this scale")
+                parks = None
+            elif natural_mode and dist >= 100000:
+                park_tags = {'leisure': 'park'}
+                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+            elif dist >= 70000:
+                park_tags = {'leisure': 'park'}
+                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+            else:
+                park_tags = {'leisure': 'park', 'landuse': 'grass'}
+                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+            if natural_mode:
+                parks = prune_features_for_scale(parks, dist)
         pbar.update(1)
+        
+        # Additional natural features if in natural mode
+        forests = None
+        grasslands = None
+        water_detailed = None
+        trails = None
+        rugged = None
+        if natural_mode and not place_name:  # Only for point-based maps
+            # 4. Fetch Forests
+            pbar.set_description("Downloading forests/woods")
+            forests = fetch_natural_features(point, feature_query_dist, 'forests', scale_dist=dist)
+            pbar.update(1)
+
+            if dist < 70000:
+                # 5. Fetch Grasslands/Meadows
+                pbar.set_description("Downloading grasslands/meadows")
+                grasslands = fetch_natural_features(point, feature_query_dist, 'grasslands', scale_dist=dist)
+                pbar.update(1)
+
+                # 6. Fetch Detailed Water (rivers, streams)
+                pbar.set_description("Downloading rivers/streams")
+                water_detailed = fetch_natural_features(point, feature_query_dist, 'water_detailed', scale_dist=dist)
+                pbar.update(1)
+
+                if natural_style['show_trails']:
+                    pbar.set_description("Downloading trails/paths")
+                    trails = fetch_natural_features(point, feature_query_dist, 'trails', scale_dist=dist)
+                    pbar.update(1)
+
+                if natural_style['show_rugged']:
+                    pbar.set_description("Downloading rugged terrain")
+                    rugged = fetch_natural_features(point, feature_query_dist, 'rugged', scale_dist=dist)
+                    pbar.update(1)
     
     print("✓ All data retrieved successfully!")
     
@@ -547,6 +793,70 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
                 water_polys = water_polys.to_crs(G_proj.graph['crs'])
             water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
     
+    # Natural mode: add forests, grasslands, and detailed water
+    if natural_mode:
+        # Grasslands (lighter green, behind forests)
+        if grasslands is not None and not grasslands.empty:
+            grass_polys = grasslands[grasslands.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if not grass_polys.empty:
+                try:
+                    grass_polys = ox.projection.project_gdf(grass_polys)
+                except Exception:
+                    grass_polys = grass_polys.to_crs(G_proj.graph['crs'])
+                grassland_color = THEME.get('grasslands', '#E8F4D0')
+                grass_polys.plot(ax=ax, facecolor=grassland_color, edgecolor='none', alpha=cast(float, natural_style['grass_alpha']), zorder=2)
+        
+        # Forests (darker green)
+        if forests is not None and not forests.empty:
+            forest_polys = forests[forests.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if not forest_polys.empty:
+                try:
+                    forest_polys = ox.projection.project_gdf(forest_polys)
+                except Exception:
+                    forest_polys = forest_polys.to_crs(G_proj.graph['crs'])
+                forest_color = THEME.get('forests', '#6B8E6B')
+                forest_polys.plot(ax=ax, facecolor=forest_color, edgecolor='none', alpha=cast(float, natural_style['forest_alpha']), zorder=3)
+
+        if rugged is not None and not rugged.empty:
+            rugged_polys = rugged[rugged.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if not rugged_polys.empty:
+                try:
+                    rugged_polys = ox.projection.project_gdf(rugged_polys)
+                except Exception:
+                    rugged_polys = rugged_polys.to_crs(G_proj.graph['crs'])
+                rugged_color = THEME.get('rugged', '#CDBFA5')
+                rugged_polys.plot(ax=ax, facecolor=rugged_color, edgecolor='none', alpha=0.4, zorder=3)
+        
+        # Detailed water (rivers, streams) - as lines
+        if water_detailed is not None and not water_detailed.empty:
+            # Handle both polygons and lines for water features
+            water_lines = water_detailed[water_detailed.geometry.type.isin(['LineString', 'MultiLineString'])]
+            water_polys_detailed = water_detailed[water_detailed.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            
+            if not water_lines.empty:
+                try:
+                    water_lines = ox.projection.project_gdf(water_lines)
+                except Exception:
+                    water_lines = water_lines.to_crs(G_proj.graph['crs'])
+                water_lines.plot(ax=ax, edgecolor=THEME['water'], linewidth=1.5, zorder=4)
+            
+            if not water_polys_detailed.empty:
+                try:
+                    water_polys_detailed = ox.projection.project_gdf(water_polys_detailed)
+                except Exception:
+                    water_polys_detailed = water_polys_detailed.to_crs(G_proj.graph['crs'])
+                water_polys_detailed.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=4)
+
+        if trails is not None and not trails.empty:
+            trail_lines = trails[trails.geometry.type.isin(['LineString', 'MultiLineString'])]
+            if not trail_lines.empty:
+                try:
+                    trail_lines = ox.projection.project_gdf(trail_lines)
+                except Exception:
+                    trail_lines = trail_lines.to_crs(G_proj.graph['crs'])
+                trail_color = THEME.get('trails', THEME['text'])
+                trail_lines.plot(ax=ax, color=trail_color, linewidth=0.7, alpha=0.45, zorder=6)
+    
     if parks is not None and not parks.empty:
         # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
         parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
@@ -556,12 +866,20 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
                 parks_polys = ox.projection.project_gdf(parks_polys)
             except Exception:
                 parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
-            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
+            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=5)
     
     # Layer 2: Roads with hierarchy coloring
+    # In natural mode, make roads lighter and thinner
     print("Applying road hierarchy colors...")
     edge_colors = get_edge_colors_by_type(G_proj)
     edge_widths = get_edge_widths_by_type(G_proj)
+    
+    # Adjust roads for natural mode
+    if natural_mode:
+        road_alpha = cast(float, natural_style['road_alpha'])
+        road_width_scale = cast(float, natural_style['road_width_scale'])
+        edge_colors = [mcolors.to_hex(mcolors.to_rgba(c, alpha=road_alpha), keep_alpha=True) for c in edge_colors]
+        edge_widths = [w * road_width_scale for w in edge_widths]
 
     # Determine cropping limits to maintain the poster aspect ratio
     if place_name:
@@ -593,7 +911,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             crop_ylim = (data_y_min, data_y_max)
     else:
         # For point-based maps, use the compensated distance
-        crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, compensated_dist)
+        crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, query_dist)
     # Plot the projected graph and then apply the cropped limits
     ox.plot_graph(
         G_proj, ax=ax, bgcolor=THEME['bg'],
@@ -662,6 +980,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
             color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
     
+    if point is None:
+        raise RuntimeError("Failed to determine map center point.")
+
     lat, lon = point
     coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
     if lon < 0:
@@ -687,7 +1008,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     print(f"Saving to {output_file}...")
 
     fmt = output_format.lower()
-    save_kwargs = dict(facecolor=THEME["bg"], bbox_inches="tight", pad_inches=0.05,)
+    save_kwargs = dict(facecolor=THEME["bg"], bbox_inches="tight", pad_inches=0,)
 
     # DPI matters mainly for raster formats
     if fmt == "png":
@@ -744,6 +1065,7 @@ Examples:
   python create_map_poster.py --lat 52.3676 --lon 4.9041 --city-label "Amsterdam" --country-label "Netherlands" -t japanese_ink -d 15000
   python create_map_poster.py --lat 40.7580 --lon -73.9855 --city-label "Times Square" -t neon_cyberpunk -d 5000
   python create_map_poster.py --lat 51.5074 --lon -0.1278 -t noir -d 10000  # Will show "CUSTOM LOCATION"
+    python create_map_poster.py --lat 44.1640832 --lon 6.1878515 --city-label "Alpes-de-Haute-Provence" --country-label "France" -t forest -d 25000 --natural --natural-detail high
   
   # Countries, states, and large areas (uses bounding box, ignores --distance)
   # Best for small-medium countries and regions:
@@ -772,6 +1094,8 @@ Options:
   --theme, -t       Theme name (default: feature_based)
   --all-themes      Generate posters for all themes
   --distance, -d    Map radius in meters (default: 29000, ignored when using --place)
+    --natural, -n     Emphasize forests, water, grasslands, trails instead of roads
+    --natural-detail  Natural mode strength: low, medium, high
   --output, -o      Output path: directory or full file path
   --list-themes     List all available themes
 
@@ -837,6 +1161,8 @@ Examples:
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
     parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
     parser.add_argument('--output', '-o', type=str, help='Output path: directory (e.g., ./maps/) or full file path (e.g., ./maps/my_map.png)')
+    parser.add_argument('--natural', '-n', action='store_true', help='Natural/terrain mode: emphasize forests, water, grasslands instead of roads (ideal for national parks and natural regions)')
+    parser.add_argument('--natural-detail', choices=['low', 'medium', 'high'], default='medium', help='How strongly natural mode emphasizes terrain features (default: medium)')
     
     args = parser.parse_args()
     
@@ -876,7 +1202,7 @@ Examples:
     available_themes = get_available_themes()
     if not available_themes:
         print("No themes found in 'themes/' directory.")
-        os.sys.exit(1)
+        sys.exit(1)
 
     if args.all_themes:
         themes_to_generate = available_themes
@@ -884,7 +1210,7 @@ Examples:
         if args.theme not in available_themes:
             print(f"Error: Theme '{args.theme}' not found.")
             print(f"Available themes: {', '.join(available_themes)}")
-            os.sys.exit(1)
+            sys.exit(1)
         themes_to_generate = [args.theme]
     
     print("=" * 50)
@@ -920,7 +1246,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(filename_base, theme_name, args.format, output_path=args.output)
-            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name)
+            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name, natural_mode=args.natural, natural_detail=args.natural_detail)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")

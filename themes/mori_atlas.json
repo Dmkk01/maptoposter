@@ -1,0 +1,19 @@
+{
+  "name": "Mori Atlas Botanical",
+  "description": "Minimal botanical theme with soft greens and muted terrain contrast",
+  "bg": "#F4F8F3",
+  "text": "#2D2539",
+  "gradient_color": "#F4F8F3",
+  "water": "#EEF0F6",
+  "parks": "#DDEDD9",
+  "forests": "#5F7F56",
+  "grasslands": "#FFF6C7",
+  "trails": "#596458",
+  "rugged": "#D6CD9A",
+  "road_motorway": "#64527F",
+  "road_primary": "#7A8A72",
+  "road_secondary": "#A5B7A2",
+  "road_tertiary": "#E2EFE0",
+  "road_residential": "#FFFFFF",
+  "road_default": "#A5B7A2"
+}
