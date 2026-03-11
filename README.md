@@ -41,6 +41,7 @@ python create_map_poster.py --city <city> --country <country> [options]
 | `--country` | `-C` | Country name | required |
 | **OPTIONAL:** `--name` | | Override display name (city display on poster) | |
 | **OPTIONAL:** `--country-label` | | Override display country (country display on poster) | |
+| **OPTIONAL:** `--no-text` | | Hide all text overlays and gradient title bands | |
 | **OPTIONAL:** `--theme` | `-t` | Theme name | feature_based |
 | **OPTIONAL:** `--distance` | `-d` | Map radius in meters | 29000 |
 | **OPTIONAL:** `--list-themes` | | List all available themes | |
@@ -95,6 +96,9 @@ python create_map_poster.py --list-themes
 
 # Generate posters for every theme
 python create_map_poster.py -c "Tokyo" -C "Japan" --all-themes
+
+# Export a clean map without any text overlays
+python create_map_poster.py -c "Zurich" -C "Switzerland" -t blueprint --no-text
 ```
 
 ### Distance Guide

@@ -644,7 +644,7 @@ def get_natural_style(detail_level: str) -> dict[str, float | bool]:
 
 
 
-def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, place_name=None, natural_mode=False, natural_detail='medium'):
+def create_poster(city, country, point, dist, output_file, output_format, width=12, height=16, country_label=None, name_label=None, place_name=None, natural_mode=False, natural_detail='medium', include_text=True):
     """
     Create a map poster. Can use either:
     - point + dist for radius-based maps
@@ -924,85 +924,84 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
     
-    # Layer 3: Gradients (Top and Bottom)
-    create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
-    create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
-    
-    # Calculate scale factor based on poster width (reference width 12 inches)
-    scale_factor = width / 12.0
-    
-    # Base font sizes (at 12 inches width)
-    BASE_MAIN = 60
-    BASE_TOP = 40
-    BASE_SUB = 22
-    BASE_COORDS = 14
-    BASE_ATTR = 8
-    
-    # 4. Typography using Roboto font
-    if FONTS:
-        font_main = FontProperties(fname=FONTS['bold'], size=BASE_MAIN * scale_factor)
-        font_top = FontProperties(fname=FONTS['bold'], size=BASE_TOP * scale_factor)
-        font_sub = FontProperties(fname=FONTS['light'], size=BASE_SUB * scale_factor)
-        font_coords = FontProperties(fname=FONTS['regular'], size=BASE_COORDS * scale_factor)
-        font_attr = FontProperties(fname=FONTS['light'], size=BASE_ATTR * scale_factor)
-    else:
-        # Fallback to system fonts
-        font_main = FontProperties(family='monospace', weight='bold', size=BASE_MAIN * scale_factor)
-        font_top = FontProperties(family='monospace', weight='bold', size=BASE_TOP * scale_factor)
-        font_sub = FontProperties(family='monospace', weight='normal', size=BASE_SUB * scale_factor)
-        font_coords = FontProperties(family='monospace', size=BASE_COORDS * scale_factor)
-        font_attr = FontProperties(family='monospace', size=BASE_ATTR * scale_factor)
-    
-    spaced_city = "  ".join(list(city.upper()))
-    
-    # Dynamically adjust font size based on city name length to prevent truncation
-    # We use the already scaled "main" font size as the starting point.
-    base_adjusted_main = BASE_MAIN * scale_factor
-    city_char_count = len(city)
-    
-    # Heuristic: If length is > 10, start reducing.
-    if city_char_count > 10:
-        length_factor = 10 / city_char_count
-        adjusted_font_size = max(base_adjusted_main * length_factor, 10 * scale_factor) 
-    else:
-        adjusted_font_size = base_adjusted_main
-    
-    if FONTS:
-        font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
-    else:
-        font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
+    if include_text:
+        # Layer 3: Gradients (Top and Bottom)
+        create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
+        create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
 
-    # --- BOTTOM TEXT ---
-    ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
-            color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
-    
-    country_text = country_label if country_label is not None else country
-    ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
-            color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
-    
-    if point is None:
-        raise RuntimeError("Failed to determine map center point.")
+        # Calculate scale factor based on poster width (reference width 12 inches)
+        scale_factor = width / 12.0
 
-    lat, lon = point
-    coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
-    if lon < 0:
-        coords = coords.replace("E", "W")
-    
-    ax.text(0.5, 0.07, coords, transform=ax.transAxes,
-            color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
-    
-    ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes, 
-            color=THEME['text'], linewidth=1 * scale_factor, zorder=11)
+        # Base font sizes (at 12 inches width)
+        BASE_MAIN = 60
+        BASE_TOP = 40
+        BASE_SUB = 22
+        BASE_COORDS = 14
+        BASE_ATTR = 8
 
-    # --- ATTRIBUTION (bottom right) ---
-    if FONTS:
-        font_attr = FontProperties(fname=FONTS['light'], size=8)
-    else:
-        font_attr = FontProperties(family='monospace', size=8)
-    
-    ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
-            color=THEME['text'], alpha=0.5, ha='right', va='bottom', 
-            fontproperties=font_attr, zorder=11)
+        # 4. Typography using Roboto font
+        if FONTS:
+            font_main = FontProperties(fname=FONTS['bold'], size=BASE_MAIN * scale_factor)
+            font_top = FontProperties(fname=FONTS['bold'], size=BASE_TOP * scale_factor)
+            font_sub = FontProperties(fname=FONTS['light'], size=BASE_SUB * scale_factor)
+            font_coords = FontProperties(fname=FONTS['regular'], size=BASE_COORDS * scale_factor)
+            font_attr = FontProperties(fname=FONTS['light'], size=BASE_ATTR * scale_factor)
+        else:
+            # Fallback to system fonts
+            font_main = FontProperties(family='monospace', weight='bold', size=BASE_MAIN * scale_factor)
+            font_top = FontProperties(family='monospace', weight='bold', size=BASE_TOP * scale_factor)
+            font_sub = FontProperties(family='monospace', weight='normal', size=BASE_SUB * scale_factor)
+            font_coords = FontProperties(family='monospace', size=BASE_COORDS * scale_factor)
+            font_attr = FontProperties(family='monospace', size=BASE_ATTR * scale_factor)
+
+        spaced_city = "  ".join(list(city.upper()))
+
+        # Dynamically adjust font size based on city name length to prevent truncation.
+        base_adjusted_main = BASE_MAIN * scale_factor
+        city_char_count = len(city)
+
+        if city_char_count > 10:
+            length_factor = 10 / city_char_count
+            adjusted_font_size = max(base_adjusted_main * length_factor, 10 * scale_factor)
+        else:
+            adjusted_font_size = base_adjusted_main
+
+        if FONTS:
+            font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
+        else:
+            font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
+
+        # --- BOTTOM TEXT ---
+        ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
+                color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
+
+        country_text = country_label if country_label is not None else country
+        ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
+                color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
+
+        if point is None:
+            raise RuntimeError("Failed to determine map center point.")
+
+        lat, lon = point
+        coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
+        if lon < 0:
+            coords = coords.replace("E", "W")
+
+        ax.text(0.5, 0.07, coords, transform=ax.transAxes,
+                color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
+
+        ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes,
+                color=THEME['text'], linewidth=1 * scale_factor, zorder=11)
+
+        # --- ATTRIBUTION (bottom right) ---
+        if FONTS:
+            font_attr = FontProperties(fname=FONTS['light'], size=8)
+        else:
+            font_attr = FontProperties(family='monospace', size=8)
+
+        ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
+                color=THEME['text'], alpha=0.5, ha='right', va='bottom',
+                fontproperties=font_attr, zorder=11)
 
     # 5. Save
     print(f"Saving to {output_file}...")
@@ -1076,8 +1075,11 @@ Examples:
   python create_map_poster.py -p "Netherlands" --city-label "Nederland" -t blueprint  # Larger country (may take 2-3 min)
   
   # Using custom output path
-  python create_map_poster.py -c "Amsterdam" -C "Netherlands" -t japanese_ink -o "/path/to/output/amsterdam.png"
+    python create_map_poster.py -c "Amsterdam" -C "Netherlands" -t japanese_ink -o "/path/to/output/amsterdam.png"
   python create_map_poster.py -c "Paris" -C "France" -t pastel_dream -o "./my_maps/"  # Directory only
+
+    # Text-free export
+    python create_map_poster.py -c "Zurich" -C "Switzerland" -t blueprint --no-text
   
   # List themes
   python create_map_poster.py --list-themes
@@ -1091,6 +1093,7 @@ Options:
   --lon             Longitude coordinate (use with --lat instead of --city/--country)
   --city-label      Override city text displayed on poster
   --country-label   Override country text displayed on poster
+    --no-text         Hide all text overlays and gradient title bands
   --theme, -t       Theme name (default: feature_based)
   --all-themes      Generate posters for all themes
   --distance, -d    Map radius in meters (default: 29000, ignored when using --place)
@@ -1153,6 +1156,7 @@ Examples:
     parser.add_argument('--lon', type=float, help='Longitude (use with --lat instead of --city/--country)')
     parser.add_argument('--city-label', dest='city_label', type=str, help='Override city text displayed on poster')
     parser.add_argument('--country-label', dest='country_label', type=str, help='Override country text displayed on poster')
+    parser.add_argument('--no-text', action='store_true', help='Hide all text overlays and gradient title bands')
     parser.add_argument('--theme', '-t', type=str, default='feature_based', help='Theme name (default: feature_based)')
     parser.add_argument('--all-themes', '--All-themes', dest='all_themes', action='store_true', help='Generate posters for all themes')
     parser.add_argument('--distance', '-d', type=int, default=29000, help='Map radius in meters (default: 29000)')
@@ -1246,7 +1250,7 @@ Examples:
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
             output_file = generate_output_filename(filename_base, theme_name, args.format, output_path=args.output)
-            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name, natural_mode=args.natural, natural_detail=args.natural_detail)
+            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name, natural_mode=args.natural, natural_detail=args.natural_detail, include_text=not args.no_text)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
