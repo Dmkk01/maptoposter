@@ -311,7 +311,7 @@ def get_coordinates(city, country):
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
     
-def get_crop_limits(G_proj, center_lat_lon, fig, dist):
+def get_crop_limits(target_crs, center_lat_lon, fig, dist):
     """
     Crop inward to preserve aspect ratio while guaranteeing
     full coverage of the requested radius.
@@ -323,7 +323,7 @@ def get_crop_limits(G_proj, center_lat_lon, fig, dist):
         ox.projection.project_geometry(
             Point(lon, lat),
             crs="EPSG:4326",
-            to_crs=G_proj.graph["crs"]
+            to_crs=target_crs
         )[0]
     )
     center_point = cast(Point, center)
@@ -665,6 +665,7 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     natural_style = get_natural_style(natural_detail)
     query_dist = dist
     feature_query_dist = dist
+    graph_fetch_failed = False
     
     # Progress bar for data fetching
     extra_steps = 0
@@ -697,7 +698,11 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             cache_variant = md5(f"{network_type}|{custom_filter}".encode('utf-8')).hexdigest()[:10]
             G = fetch_graph(point, query_dist, network_type=network_type, custom_filter=custom_filter, cache_variant=cache_variant)
             if G is None:
-                raise RuntimeError("Failed to retrieve street network data.")
+                if natural_mode:
+                    print("⚠ No street network found in the requested area; continuing with natural features only")
+                    graph_fetch_failed = True
+                else:
+                    raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
         
         # 2. Fetch Water Features
@@ -777,8 +782,17 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     ax.set_facecolor(THEME['bg'])
     ax.set_position((0.0, 0.0, 1.0, 1.0))
 
+    if point is None:
+        raise RuntimeError("Failed to determine map center point.")
+
+    lat, lon = point
+    projected_center, target_crs = ox.projection.project_geometry(Point(lon, lat), crs="EPSG:4326")
+    center_point = cast(Point, projected_center)
+
     # Project graph to a metric CRS so distances and aspect are linear (meters)
-    G_proj = ox.project_graph(G)
+    G_proj = ox.project_graph(cast(MultiDiGraph, G)) if G is not None else None
+    if G_proj is not None:
+        target_crs = G_proj.graph['crs']
     
     # 3. Plot Layers
     # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
@@ -788,9 +802,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if not water_polys.empty:
             # Project water features in the same CRS as the graph
             try:
-                water_polys = ox.projection.project_gdf(water_polys)
+                water_polys = ox.projection.project_gdf(water_polys, to_crs=target_crs)
             except Exception:
-                water_polys = water_polys.to_crs(G_proj.graph['crs'])
+                water_polys = water_polys.to_crs(target_crs)
             water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
     
     # Natural mode: add forests, grasslands, and detailed water
@@ -800,9 +814,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             grass_polys = grasslands[grasslands.geometry.type.isin(['Polygon', 'MultiPolygon'])]
             if not grass_polys.empty:
                 try:
-                    grass_polys = ox.projection.project_gdf(grass_polys)
+                    grass_polys = ox.projection.project_gdf(grass_polys, to_crs=target_crs)
                 except Exception:
-                    grass_polys = grass_polys.to_crs(G_proj.graph['crs'])
+                    grass_polys = grass_polys.to_crs(target_crs)
                 grassland_color = THEME.get('grasslands', '#E8F4D0')
                 grass_polys.plot(ax=ax, facecolor=grassland_color, edgecolor='none', alpha=cast(float, natural_style['grass_alpha']), zorder=2)
         
@@ -811,9 +825,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             forest_polys = forests[forests.geometry.type.isin(['Polygon', 'MultiPolygon'])]
             if not forest_polys.empty:
                 try:
-                    forest_polys = ox.projection.project_gdf(forest_polys)
+                    forest_polys = ox.projection.project_gdf(forest_polys, to_crs=target_crs)
                 except Exception:
-                    forest_polys = forest_polys.to_crs(G_proj.graph['crs'])
+                    forest_polys = forest_polys.to_crs(target_crs)
                 forest_color = THEME.get('forests', '#6B8E6B')
                 forest_polys.plot(ax=ax, facecolor=forest_color, edgecolor='none', alpha=cast(float, natural_style['forest_alpha']), zorder=3)
 
@@ -821,9 +835,9 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             rugged_polys = rugged[rugged.geometry.type.isin(['Polygon', 'MultiPolygon'])]
             if not rugged_polys.empty:
                 try:
-                    rugged_polys = ox.projection.project_gdf(rugged_polys)
+                    rugged_polys = ox.projection.project_gdf(rugged_polys, to_crs=target_crs)
                 except Exception:
-                    rugged_polys = rugged_polys.to_crs(G_proj.graph['crs'])
+                    rugged_polys = rugged_polys.to_crs(target_crs)
                 rugged_color = THEME.get('rugged', '#CDBFA5')
                 rugged_polys.plot(ax=ax, facecolor=rugged_color, edgecolor='none', alpha=0.4, zorder=3)
         
@@ -835,25 +849,25 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             
             if not water_lines.empty:
                 try:
-                    water_lines = ox.projection.project_gdf(water_lines)
+                    water_lines = ox.projection.project_gdf(water_lines, to_crs=target_crs)
                 except Exception:
-                    water_lines = water_lines.to_crs(G_proj.graph['crs'])
+                    water_lines = water_lines.to_crs(target_crs)
                 water_lines.plot(ax=ax, edgecolor=THEME['water'], linewidth=1.5, zorder=4)
             
             if not water_polys_detailed.empty:
                 try:
-                    water_polys_detailed = ox.projection.project_gdf(water_polys_detailed)
+                    water_polys_detailed = ox.projection.project_gdf(water_polys_detailed, to_crs=target_crs)
                 except Exception:
-                    water_polys_detailed = water_polys_detailed.to_crs(G_proj.graph['crs'])
+                    water_polys_detailed = water_polys_detailed.to_crs(target_crs)
                 water_polys_detailed.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=4)
 
         if trails is not None and not trails.empty:
             trail_lines = trails[trails.geometry.type.isin(['LineString', 'MultiLineString'])]
             if not trail_lines.empty:
                 try:
-                    trail_lines = ox.projection.project_gdf(trail_lines)
+                    trail_lines = ox.projection.project_gdf(trail_lines, to_crs=target_crs)
                 except Exception:
-                    trail_lines = trail_lines.to_crs(G_proj.graph['crs'])
+                    trail_lines = trail_lines.to_crs(target_crs)
                 trail_color = THEME.get('trails', THEME['text'])
                 trail_lines.plot(ax=ax, color=trail_color, linewidth=0.7, alpha=0.45, zorder=6)
     
@@ -863,27 +877,31 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if not parks_polys.empty:
             # Project park features in the same CRS as the graph
             try:
-                parks_polys = ox.projection.project_gdf(parks_polys)
+                parks_polys = ox.projection.project_gdf(parks_polys, to_crs=target_crs)
             except Exception:
-                parks_polys = parks_polys.to_crs(G_proj.graph['crs'])
+                parks_polys = parks_polys.to_crs(target_crs)
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=5)
     
     # Layer 2: Roads with hierarchy coloring
     # In natural mode, make roads lighter and thinner
-    print("Applying road hierarchy colors...")
-    edge_colors = get_edge_colors_by_type(G_proj)
-    edge_widths = get_edge_widths_by_type(G_proj)
-    
-    # Adjust roads for natural mode
-    if natural_mode:
-        road_alpha = cast(float, natural_style['road_alpha'])
-        road_width_scale = cast(float, natural_style['road_width_scale'])
-        edge_colors = [mcolors.to_hex(mcolors.to_rgba(c, alpha=road_alpha), keep_alpha=True) for c in edge_colors]
-        edge_widths = [w * road_width_scale for w in edge_widths]
+    edge_colors = None
+    edge_widths = None
+    if G_proj is not None:
+        print("Applying road hierarchy colors...")
+        edge_colors = get_edge_colors_by_type(G_proj)
+        edge_widths = get_edge_widths_by_type(G_proj)
+        
+        # Adjust roads for natural mode
+        if natural_mode:
+            road_alpha = cast(float, natural_style['road_alpha'])
+            road_width_scale = cast(float, natural_style['road_width_scale'])
+            edge_colors = [mcolors.to_hex(mcolors.to_rgba(c, alpha=road_alpha), keep_alpha=True) for c in edge_colors]
+            edge_widths = [w * road_width_scale for w in edge_widths]
 
     # Determine cropping limits to maintain the poster aspect ratio
     if place_name:
         # For place-based maps, adjust bounding box to match figure aspect ratio
+        assert G_proj is not None
         nodes = ox.graph_to_gdfs(G_proj, edges=False)
         data_x_min, data_x_max = nodes.geometry.x.min(), nodes.geometry.x.max()
         data_y_min, data_y_max = nodes.geometry.y.min(), nodes.geometry.y.max()
@@ -911,18 +929,22 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
             crop_ylim = (data_y_min, data_y_max)
     else:
         # For point-based maps, use the compensated distance
-        crop_xlim, crop_ylim = get_crop_limits(G_proj, point, fig, query_dist)
+        crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, query_dist)
     # Plot the projected graph and then apply the cropped limits
-    ox.plot_graph(
-        G_proj, ax=ax, bgcolor=THEME['bg'],
-        node_size=0,
-        edge_color=edge_colors,
-        edge_linewidth=edge_widths,
-        show=False, close=False
-    )
+    if G_proj is not None:
+        assert edge_colors is not None
+        assert edge_widths is not None
+        ox.plot_graph(
+            G_proj, ax=ax, bgcolor=THEME['bg'],
+            node_size=0,
+            edge_color=edge_colors,
+            edge_linewidth=edge_widths,
+            show=False, close=False
+        )
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
+    ax.set_axis_off()
     
     if include_text:
         # Layer 3: Gradients (Top and Bottom)
@@ -979,10 +1001,6 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
                 color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
 
-        if point is None:
-            raise RuntimeError("Failed to determine map center point.")
-
-        lat, lon = point
         coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
         if lon < 0:
             coords = coords.replace("E", "W")
