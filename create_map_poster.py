@@ -15,6 +15,7 @@ from datetime import datetime
 import argparse
 import pickle
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
 from hashlib import md5
 from typing import cast
@@ -36,6 +37,45 @@ FONTS_DIR = "fonts"
 POSTERS_DIR = "posters"
 
 CACHE_DIR = ".cache"
+
+
+class StepTimer:
+    """Collect and print elapsed time for major execution stages."""
+
+    def __init__(self):
+        self.records: list[tuple[str, float]] = []
+        self._start = time.perf_counter()
+
+    @contextmanager
+    def track(self, label: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.records.append((label, time.perf_counter() - start))
+
+    def total_seconds(self) -> float:
+        return time.perf_counter() - self._start
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        minutes = int(seconds // 60)
+        remaining_seconds = seconds - (minutes * 60)
+        return f"{minutes}m {remaining_seconds:05.2f}s"
+
+    def print_summary(self, header: str = "Timing summary", include_total: bool = True):
+        total_seconds = self.total_seconds()
+        print(f"\n{header}")
+        for label, seconds in self.records:
+            percentage = (seconds / total_seconds * 100) if total_seconds > 0 else 0.0
+            print(f"{label}: {self.format_duration(seconds)} ({percentage:.1f}% of total)")
+        tracked_seconds = sum(seconds for _, seconds in self.records)
+        untracked_seconds = max(0.0, total_seconds - tracked_seconds)
+        if untracked_seconds >= 0.01:
+            percentage = (untracked_seconds / total_seconds * 100) if total_seconds > 0 else 0.0
+            print(f"untracked: {self.format_duration(untracked_seconds)} ({percentage:.1f}% of total)")
+        if include_total:
+            print(f"total: {self.format_duration(total_seconds)} (100.0% of total)")
 
 def _cache_path(key: str) -> str:
     safe = key.replace(os.sep, "_")
@@ -651,6 +691,8 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     - place_name for bounding box maps (countries, regions)
     - natural_mode: emphasizes natural features (forests, water, terrain) instead of roads
     """
+    timer = StepTimer()
+
     if place_name:
         print(f"\nGenerating map for {place_name}...")
     else:
@@ -682,63 +724,66 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
-        
-        if place_name:
-            # Use place-based fetching for large areas
-            G, center_point = fetch_graph_from_place(place_name)
-            if G is None:
-                raise RuntimeError("Failed to retrieve street network data for place.")
-            # Override point with calculated center
-            point = center_point
-        else:
-            # Use point + radius for smaller areas
-            query_dist = dist * (max(height, width) / min(height, width)) / 4
-            feature_query_dist = get_feature_query_dist(dist, query_dist)
-            network_type, custom_filter = get_road_query_options(dist, natural_mode, natural_detail)
-            cache_variant = md5(f"{network_type}|{custom_filter}".encode('utf-8')).hexdigest()[:10]
-            G = fetch_graph(point, query_dist, network_type=network_type, custom_filter=custom_filter, cache_variant=cache_variant)
-            if G is None:
-                if natural_mode:
-                    print("⚠ No street network found in the requested area; continuing with natural features only")
-                    graph_fetch_failed = True
-                else:
-                    raise RuntimeError("Failed to retrieve street network data.")
+
+        with timer.track("street network"):
+            if place_name:
+                # Use place-based fetching for large areas
+                G, center_point = fetch_graph_from_place(place_name)
+                if G is None:
+                    raise RuntimeError("Failed to retrieve street network data for place.")
+                # Override point with calculated center
+                point = center_point
+            else:
+                # Use point + radius for smaller areas
+                query_dist = dist * (max(height, width) / min(height, width)) / 4
+                feature_query_dist = get_feature_query_dist(dist, query_dist)
+                network_type, custom_filter = get_road_query_options(dist, natural_mode, natural_detail)
+                cache_variant = md5(f"{network_type}|{custom_filter}".encode('utf-8')).hexdigest()[:10]
+                G = fetch_graph(point, query_dist, network_type=network_type, custom_filter=custom_filter, cache_variant=cache_variant)
+                if G is None:
+                    if natural_mode:
+                        print("⚠ No street network found in the requested area; continuing with natural features only")
+                        graph_fetch_failed = True
+                    else:
+                        raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
         
         # 2. Fetch Water Features
         pbar.set_description("Downloading water features")
-        if place_name:
-            water = fetch_features_from_place(place_name, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
-        else:
-            if dist >= 70000:
-                water_tags = {'natural': 'water'}
+        with timer.track("water features"):
+            if place_name:
+                water = fetch_features_from_place(place_name, tags={'natural': 'water', 'waterway': 'riverbank'}, name='water')
             else:
-                water_tags = {'natural': 'water', 'waterway': 'riverbank'}
-            water = fetch_features(point, feature_query_dist, tags=water_tags, name='water')
-            if natural_mode:
-                water = prune_features_for_scale(water, dist)
+                if dist >= 70000:
+                    water_tags = {'natural': 'water'}
+                else:
+                    water_tags = {'natural': 'water', 'waterway': 'riverbank'}
+                water = fetch_features(point, feature_query_dist, tags=water_tags, name='water')
+                if natural_mode:
+                    water = prune_features_for_scale(water, dist)
         pbar.update(1)
         
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
-        if place_name:
-            parks = fetch_features_from_place(place_name, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
-        else:
-            park_tags: dict[str, bool | str | list[str]]
-            if dist >= 140000 and not natural_mode:
-                print("⚠ Skipping parks at this scale")
-                parks = None
-            elif natural_mode and dist >= 100000:
-                park_tags = {'leisure': 'park'}
-                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
-            elif dist >= 70000:
-                park_tags = {'leisure': 'park'}
-                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+        with timer.track("parks"):
+            if place_name:
+                parks = fetch_features_from_place(place_name, tags={'leisure': 'park', 'landuse': 'grass'}, name='parks')
             else:
-                park_tags = {'leisure': 'park', 'landuse': 'grass'}
-                parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
-            if natural_mode:
-                parks = prune_features_for_scale(parks, dist)
+                park_tags: dict[str, bool | str | list[str]]
+                if dist >= 140000 and not natural_mode:
+                    print("⚠ Skipping parks at this scale")
+                    parks = None
+                elif natural_mode and dist >= 100000:
+                    park_tags = {'leisure': 'park'}
+                    parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+                elif dist >= 70000:
+                    park_tags = {'leisure': 'park'}
+                    parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+                else:
+                    park_tags = {'leisure': 'park', 'landuse': 'grass'}
+                    parks = fetch_features(point, feature_query_dist, tags=park_tags, name='parks')
+                if natural_mode:
+                    parks = prune_features_for_scale(parks, dist)
         pbar.update(1)
         
         # Additional natural features if in natural mode
@@ -750,276 +795,282 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
         if natural_mode and not place_name:  # Only for point-based maps
             # 4. Fetch Forests
             pbar.set_description("Downloading forests/woods")
-            forests = fetch_natural_features(point, feature_query_dist, 'forests', scale_dist=dist)
+            with timer.track("forests"):
+                forests = fetch_natural_features(point, feature_query_dist, 'forests', scale_dist=dist)
             pbar.update(1)
 
             if dist < 70000:
                 # 5. Fetch Grasslands/Meadows
                 pbar.set_description("Downloading grasslands/meadows")
-                grasslands = fetch_natural_features(point, feature_query_dist, 'grasslands', scale_dist=dist)
+                with timer.track("grasslands"):
+                    grasslands = fetch_natural_features(point, feature_query_dist, 'grasslands', scale_dist=dist)
                 pbar.update(1)
 
                 # 6. Fetch Detailed Water (rivers, streams)
                 pbar.set_description("Downloading rivers/streams")
-                water_detailed = fetch_natural_features(point, feature_query_dist, 'water_detailed', scale_dist=dist)
+                with timer.track("detailed water"):
+                    water_detailed = fetch_natural_features(point, feature_query_dist, 'water_detailed', scale_dist=dist)
                 pbar.update(1)
 
                 if natural_style['show_trails']:
                     pbar.set_description("Downloading trails/paths")
-                    trails = fetch_natural_features(point, feature_query_dist, 'trails', scale_dist=dist)
+                    with timer.track("trails"):
+                        trails = fetch_natural_features(point, feature_query_dist, 'trails', scale_dist=dist)
                     pbar.update(1)
 
                 if natural_style['show_rugged']:
                     pbar.set_description("Downloading rugged terrain")
-                    rugged = fetch_natural_features(point, feature_query_dist, 'rugged', scale_dist=dist)
+                    with timer.track("rugged terrain"):
+                        rugged = fetch_natural_features(point, feature_query_dist, 'rugged', scale_dist=dist)
                     pbar.update(1)
     
     print("✓ All data retrieved successfully!")
     
     # 2. Setup Plot
     print("Rendering map...")
-    fig, ax = plt.subplots(figsize=(width, height), facecolor=THEME['bg'])
-    ax.set_facecolor(THEME['bg'])
-    ax.set_position((0.0, 0.0, 1.0, 1.0))
+    with timer.track("rendering"):
+        fig, ax = plt.subplots(figsize=(width, height), facecolor=THEME['bg'])
+        ax.set_facecolor(THEME['bg'])
+        ax.set_position((0.0, 0.0, 1.0, 1.0))
 
-    if point is None:
-        raise RuntimeError("Failed to determine map center point.")
+        if point is None:
+            raise RuntimeError("Failed to determine map center point.")
 
-    lat, lon = point
-    projected_center, target_crs = ox.projection.project_geometry(Point(lon, lat), crs="EPSG:4326")
-    center_point = cast(Point, projected_center)
+        lat, lon = point
+        projected_center, target_crs = ox.projection.project_geometry(Point(lon, lat), crs="EPSG:4326")
+        center_point = cast(Point, projected_center)
 
-    # Project graph to a metric CRS so distances and aspect are linear (meters)
-    G_proj = ox.project_graph(cast(MultiDiGraph, G)) if G is not None else None
-    if G_proj is not None:
-        target_crs = G_proj.graph['crs']
-    
-    # 3. Plot Layers
-    # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
-    if water is not None and not water.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        water_polys = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not water_polys.empty:
-            # Project water features in the same CRS as the graph
-            try:
-                water_polys = ox.projection.project_gdf(water_polys, to_crs=target_crs)
-            except Exception:
-                water_polys = water_polys.to_crs(target_crs)
-            water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
-    
-    # Natural mode: add forests, grasslands, and detailed water
-    if natural_mode:
-        # Grasslands (lighter green, behind forests)
-        if grasslands is not None and not grasslands.empty:
-            grass_polys = grasslands[grasslands.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            if not grass_polys.empty:
-                try:
-                    grass_polys = ox.projection.project_gdf(grass_polys, to_crs=target_crs)
-                except Exception:
-                    grass_polys = grass_polys.to_crs(target_crs)
-                grassland_color = THEME.get('grasslands', '#E8F4D0')
-                grass_polys.plot(ax=ax, facecolor=grassland_color, edgecolor='none', alpha=cast(float, natural_style['grass_alpha']), zorder=2)
+        # Project graph to a metric CRS so distances and aspect are linear (meters)
+        G_proj = ox.project_graph(cast(MultiDiGraph, G)) if G is not None else None
+        if G_proj is not None:
+            target_crs = G_proj.graph['crs']
         
-        # Forests (darker green)
-        if forests is not None and not forests.empty:
-            forest_polys = forests[forests.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            if not forest_polys.empty:
+        # 3. Plot Layers
+        # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
+        if water is not None and not water.empty:
+            # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
+            water_polys = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if not water_polys.empty:
+                # Project water features in the same CRS as the graph
                 try:
-                    forest_polys = ox.projection.project_gdf(forest_polys, to_crs=target_crs)
+                    water_polys = ox.projection.project_gdf(water_polys, to_crs=target_crs)
                 except Exception:
-                    forest_polys = forest_polys.to_crs(target_crs)
-                forest_color = THEME.get('forests', '#6B8E6B')
-                forest_polys.plot(ax=ax, facecolor=forest_color, edgecolor='none', alpha=cast(float, natural_style['forest_alpha']), zorder=3)
-
-        if rugged is not None and not rugged.empty:
-            rugged_polys = rugged[rugged.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            if not rugged_polys.empty:
-                try:
-                    rugged_polys = ox.projection.project_gdf(rugged_polys, to_crs=target_crs)
-                except Exception:
-                    rugged_polys = rugged_polys.to_crs(target_crs)
-                rugged_color = THEME.get('rugged', '#CDBFA5')
-                rugged_polys.plot(ax=ax, facecolor=rugged_color, edgecolor='none', alpha=0.4, zorder=3)
+                    water_polys = water_polys.to_crs(target_crs)
+                water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
         
-        # Detailed water (rivers, streams) - as lines
-        if water_detailed is not None and not water_detailed.empty:
-            # Handle both polygons and lines for water features
-            water_lines = water_detailed[water_detailed.geometry.type.isin(['LineString', 'MultiLineString'])]
-            water_polys_detailed = water_detailed[water_detailed.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            
-            if not water_lines.empty:
-                try:
-                    water_lines = ox.projection.project_gdf(water_lines, to_crs=target_crs)
-                except Exception:
-                    water_lines = water_lines.to_crs(target_crs)
-                water_lines.plot(ax=ax, edgecolor=THEME['water'], linewidth=1.5, zorder=4)
-            
-            if not water_polys_detailed.empty:
-                try:
-                    water_polys_detailed = ox.projection.project_gdf(water_polys_detailed, to_crs=target_crs)
-                except Exception:
-                    water_polys_detailed = water_polys_detailed.to_crs(target_crs)
-                water_polys_detailed.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=4)
-
-        if trails is not None and not trails.empty:
-            trail_lines = trails[trails.geometry.type.isin(['LineString', 'MultiLineString'])]
-            if not trail_lines.empty:
-                try:
-                    trail_lines = ox.projection.project_gdf(trail_lines, to_crs=target_crs)
-                except Exception:
-                    trail_lines = trail_lines.to_crs(target_crs)
-                trail_color = THEME.get('trails', THEME['text'])
-                trail_lines.plot(ax=ax, color=trail_color, linewidth=0.7, alpha=0.45, zorder=6)
-    
-    if parks is not None and not parks.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not parks_polys.empty:
-            # Project park features in the same CRS as the graph
-            try:
-                parks_polys = ox.projection.project_gdf(parks_polys, to_crs=target_crs)
-            except Exception:
-                parks_polys = parks_polys.to_crs(target_crs)
-            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=5)
-    
-    # Layer 2: Roads with hierarchy coloring
-    # In natural mode, make roads lighter and thinner
-    edge_colors = None
-    edge_widths = None
-    if G_proj is not None:
-        print("Applying road hierarchy colors...")
-        edge_colors = get_edge_colors_by_type(G_proj)
-        edge_widths = get_edge_widths_by_type(G_proj)
-        
-        # Adjust roads for natural mode
+        # Natural mode: add forests, grasslands, and detailed water
         if natural_mode:
-            road_alpha = cast(float, natural_style['road_alpha'])
-            road_width_scale = cast(float, natural_style['road_width_scale'])
-            edge_colors = [mcolors.to_hex(mcolors.to_rgba(c, alpha=road_alpha), keep_alpha=True) for c in edge_colors]
-            edge_widths = [w * road_width_scale for w in edge_widths]
+            # Grasslands (lighter green, behind forests)
+            if grasslands is not None and not grasslands.empty:
+                grass_polys = grasslands[grasslands.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+                if not grass_polys.empty:
+                    try:
+                        grass_polys = ox.projection.project_gdf(grass_polys, to_crs=target_crs)
+                    except Exception:
+                        grass_polys = grass_polys.to_crs(target_crs)
+                    grassland_color = THEME.get('grasslands', '#E8F4D0')
+                    grass_polys.plot(ax=ax, facecolor=grassland_color, edgecolor='none', alpha=cast(float, natural_style['grass_alpha']), zorder=2)
+            
+            # Forests (darker green)
+            if forests is not None and not forests.empty:
+                forest_polys = forests[forests.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+                if not forest_polys.empty:
+                    try:
+                        forest_polys = ox.projection.project_gdf(forest_polys, to_crs=target_crs)
+                    except Exception:
+                        forest_polys = forest_polys.to_crs(target_crs)
+                    forest_color = THEME.get('forests', '#6B8E6B')
+                    forest_polys.plot(ax=ax, facecolor=forest_color, edgecolor='none', alpha=cast(float, natural_style['forest_alpha']), zorder=3)
 
-    # Determine cropping limits to maintain the poster aspect ratio
-    if place_name:
-        # For place-based maps, adjust bounding box to match figure aspect ratio
-        assert G_proj is not None
-        nodes = ox.graph_to_gdfs(G_proj, edges=False)
-        data_x_min, data_x_max = nodes.geometry.x.min(), nodes.geometry.x.max()
-        data_y_min, data_y_max = nodes.geometry.y.min(), nodes.geometry.y.max()
+            if rugged is not None and not rugged.empty:
+                rugged_polys = rugged[rugged.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+                if not rugged_polys.empty:
+                    try:
+                        rugged_polys = ox.projection.project_gdf(rugged_polys, to_crs=target_crs)
+                    except Exception:
+                        rugged_polys = rugged_polys.to_crs(target_crs)
+                    rugged_color = THEME.get('rugged', '#CDBFA5')
+                    rugged_polys.plot(ax=ax, facecolor=rugged_color, edgecolor='none', alpha=0.4, zorder=3)
+            
+            # Detailed water (rivers, streams) - as lines
+            if water_detailed is not None and not water_detailed.empty:
+                # Handle both polygons and lines for water features
+                water_lines = water_detailed[water_detailed.geometry.type.isin(['LineString', 'MultiLineString'])]
+                water_polys_detailed = water_detailed[water_detailed.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+                
+                if not water_lines.empty:
+                    try:
+                        water_lines = ox.projection.project_gdf(water_lines, to_crs=target_crs)
+                    except Exception:
+                        water_lines = water_lines.to_crs(target_crs)
+                    water_lines.plot(ax=ax, edgecolor=THEME['water'], linewidth=1.5, zorder=4)
+                
+                if not water_polys_detailed.empty:
+                    try:
+                        water_polys_detailed = ox.projection.project_gdf(water_polys_detailed, to_crs=target_crs)
+                    except Exception:
+                        water_polys_detailed = water_polys_detailed.to_crs(target_crs)
+                    water_polys_detailed.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=4)
+
+            if trails is not None and not trails.empty:
+                trail_lines = trails[trails.geometry.type.isin(['LineString', 'MultiLineString'])]
+                if not trail_lines.empty:
+                    try:
+                        trail_lines = ox.projection.project_gdf(trail_lines, to_crs=target_crs)
+                    except Exception:
+                        trail_lines = trail_lines.to_crs(target_crs)
+                    trail_color = THEME.get('trails', THEME['text'])
+                    trail_lines.plot(ax=ax, color=trail_color, linewidth=0.7, alpha=0.45, zorder=6)
         
-        # Calculate the data's dimensions
-        data_width = data_x_max - data_x_min
-        data_height = data_y_max - data_y_min
-        data_aspect = data_width / data_height
+        if parks is not None and not parks.empty:
+            # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
+            parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if not parks_polys.empty:
+                # Project park features in the same CRS as the graph
+                try:
+                    parks_polys = ox.projection.project_gdf(parks_polys, to_crs=target_crs)
+                except Exception:
+                    parks_polys = parks_polys.to_crs(target_crs)
+                parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=5)
         
-        # Figure aspect ratio
-        fig_aspect = width / height
+        # Layer 2: Roads with hierarchy coloring
+        # In natural mode, make roads lighter and thinner
+        edge_colors = None
+        edge_widths = None
+        if G_proj is not None:
+            print("Applying road hierarchy colors...")
+            edge_colors = get_edge_colors_by_type(G_proj)
+            edge_widths = get_edge_widths_by_type(G_proj)
+            
+            # Adjust roads for natural mode
+            if natural_mode:
+                road_alpha = cast(float, natural_style['road_alpha'])
+                road_width_scale = cast(float, natural_style['road_width_scale'])
+                edge_colors = [mcolors.to_hex(mcolors.to_rgba(c, alpha=road_alpha), keep_alpha=True) for c in edge_colors]
+                edge_widths = [w * road_width_scale for w in edge_widths]
+
+        # Determine cropping limits to maintain the poster aspect ratio
+        if place_name:
+            # For place-based maps, adjust bounding box to match figure aspect ratio
+            assert G_proj is not None
+            nodes = ox.graph_to_gdfs(G_proj, edges=False)
+            data_x_min, data_x_max = nodes.geometry.x.min(), nodes.geometry.x.max()
+            data_y_min, data_y_max = nodes.geometry.y.min(), nodes.geometry.y.max()
+            
+            # Calculate the data's dimensions
+            data_width = data_x_max - data_x_min
+            data_height = data_y_max - data_y_min
+            data_aspect = data_width / data_height
+            
+            # Figure aspect ratio
+            fig_aspect = width / height
+            
+            # Adjust limits to match figure aspect while containing all data
+            if data_aspect > fig_aspect:
+                # Data is wider than figure - expand height
+                data_center_y = (data_y_min + data_y_max) / 2
+                new_height = data_width / fig_aspect
+                crop_xlim = (data_x_min, data_x_max)
+                crop_ylim = (data_center_y - new_height/2, data_center_y + new_height/2)
+            else:
+                # Data is taller than figure - expand width
+                data_center_x = (data_x_min + data_x_max) / 2
+                new_width = data_height * fig_aspect
+                crop_xlim = (data_center_x - new_width/2, data_center_x + new_width/2)
+                crop_ylim = (data_y_min, data_y_max)
+        else:
+            # For point-based maps, use the compensated distance
+            crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, query_dist)
+        # Plot the projected graph and then apply the cropped limits
+        if G_proj is not None:
+            assert edge_colors is not None
+            assert edge_widths is not None
+            ox.plot_graph(
+                G_proj, ax=ax, bgcolor=THEME['bg'],
+                node_size=0,
+                edge_color=edge_colors,
+                edge_linewidth=edge_widths,
+                show=False, close=False
+            )
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(crop_xlim)
+        ax.set_ylim(crop_ylim)
+        ax.set_axis_off()
         
-        # Adjust limits to match figure aspect while containing all data
-        if data_aspect > fig_aspect:
-            # Data is wider than figure - expand height
-            data_center_y = (data_y_min + data_y_max) / 2
-            new_height = data_width / fig_aspect
-            crop_xlim = (data_x_min, data_x_max)
-            crop_ylim = (data_center_y - new_height/2, data_center_y + new_height/2)
-        else:
-            # Data is taller than figure - expand width
-            data_center_x = (data_x_min + data_x_max) / 2
-            new_width = data_height * fig_aspect
-            crop_xlim = (data_center_x - new_width/2, data_center_x + new_width/2)
-            crop_ylim = (data_y_min, data_y_max)
-    else:
-        # For point-based maps, use the compensated distance
-        crop_xlim, crop_ylim = get_crop_limits(target_crs, point, fig, query_dist)
-    # Plot the projected graph and then apply the cropped limits
-    if G_proj is not None:
-        assert edge_colors is not None
-        assert edge_widths is not None
-        ox.plot_graph(
-            G_proj, ax=ax, bgcolor=THEME['bg'],
-            node_size=0,
-            edge_color=edge_colors,
-            edge_linewidth=edge_widths,
-            show=False, close=False
-        )
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlim(crop_xlim)
-    ax.set_ylim(crop_ylim)
-    ax.set_axis_off()
-    
-    if include_text:
-        # Layer 3: Gradients (Top and Bottom)
-        create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
-        create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
+        if include_text:
+            # Layer 3: Gradients (Top and Bottom)
+            create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
+            create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
 
-        # Calculate scale factor based on poster width (reference width 12 inches)
-        scale_factor = width / 12.0
+            # Calculate scale factor based on poster width (reference width 12 inches)
+            scale_factor = width / 12.0
 
-        # Base font sizes (at 12 inches width)
-        BASE_MAIN = 60
-        BASE_TOP = 40
-        BASE_SUB = 22
-        BASE_COORDS = 14
-        BASE_ATTR = 8
+            # Base font sizes (at 12 inches width)
+            BASE_MAIN = 60
+            BASE_TOP = 40
+            BASE_SUB = 22
+            BASE_COORDS = 14
+            BASE_ATTR = 8
 
-        # 4. Typography using Roboto font
-        if FONTS:
-            font_main = FontProperties(fname=FONTS['bold'], size=BASE_MAIN * scale_factor)
-            font_top = FontProperties(fname=FONTS['bold'], size=BASE_TOP * scale_factor)
-            font_sub = FontProperties(fname=FONTS['light'], size=BASE_SUB * scale_factor)
-            font_coords = FontProperties(fname=FONTS['regular'], size=BASE_COORDS * scale_factor)
-            font_attr = FontProperties(fname=FONTS['light'], size=BASE_ATTR * scale_factor)
-        else:
-            # Fallback to system fonts
-            font_main = FontProperties(family='monospace', weight='bold', size=BASE_MAIN * scale_factor)
-            font_top = FontProperties(family='monospace', weight='bold', size=BASE_TOP * scale_factor)
-            font_sub = FontProperties(family='monospace', weight='normal', size=BASE_SUB * scale_factor)
-            font_coords = FontProperties(family='monospace', size=BASE_COORDS * scale_factor)
-            font_attr = FontProperties(family='monospace', size=BASE_ATTR * scale_factor)
+            # 4. Typography using Roboto font
+            if FONTS:
+                font_main = FontProperties(fname=FONTS['bold'], size=BASE_MAIN * scale_factor)
+                font_top = FontProperties(fname=FONTS['bold'], size=BASE_TOP * scale_factor)
+                font_sub = FontProperties(fname=FONTS['light'], size=BASE_SUB * scale_factor)
+                font_coords = FontProperties(fname=FONTS['regular'], size=BASE_COORDS * scale_factor)
+                font_attr = FontProperties(fname=FONTS['light'], size=BASE_ATTR * scale_factor)
+            else:
+                # Fallback to system fonts
+                font_main = FontProperties(family='monospace', weight='bold', size=BASE_MAIN * scale_factor)
+                font_top = FontProperties(family='monospace', weight='bold', size=BASE_TOP * scale_factor)
+                font_sub = FontProperties(family='monospace', weight='normal', size=BASE_SUB * scale_factor)
+                font_coords = FontProperties(family='monospace', size=BASE_COORDS * scale_factor)
+                font_attr = FontProperties(family='monospace', size=BASE_ATTR * scale_factor)
 
-        spaced_city = "  ".join(list(city.upper()))
+            spaced_city = "  ".join(list(city.upper()))
 
-        # Dynamically adjust font size based on city name length to prevent truncation.
-        base_adjusted_main = BASE_MAIN * scale_factor
-        city_char_count = len(city)
+            # Dynamically adjust font size based on city name length to prevent truncation.
+            base_adjusted_main = BASE_MAIN * scale_factor
+            city_char_count = len(city)
 
-        if city_char_count > 10:
-            length_factor = 10 / city_char_count
-            adjusted_font_size = max(base_adjusted_main * length_factor, 10 * scale_factor)
-        else:
-            adjusted_font_size = base_adjusted_main
+            if city_char_count > 10:
+                length_factor = 10 / city_char_count
+                adjusted_font_size = max(base_adjusted_main * length_factor, 10 * scale_factor)
+            else:
+                adjusted_font_size = base_adjusted_main
 
-        if FONTS:
-            font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
-        else:
-            font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
+            if FONTS:
+                font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
+            else:
+                font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
 
-        # --- BOTTOM TEXT ---
-        ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
-                color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
+            # --- BOTTOM TEXT ---
+            ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
+                    color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
 
-        country_text = country_label if country_label is not None else country
-        ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
-                color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
+            country_text = country_label if country_label is not None else country
+            ax.text(0.5, 0.10, country_text.upper(), transform=ax.transAxes,
+                    color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
 
-        coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
-        if lon < 0:
-            coords = coords.replace("E", "W")
+            coords = f"{lat:.4f}° N / {lon:.4f}° E" if lat >= 0 else f"{abs(lat):.4f}° S / {lon:.4f}° E"
+            if lon < 0:
+                coords = coords.replace("E", "W")
 
-        ax.text(0.5, 0.07, coords, transform=ax.transAxes,
-                color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
+            ax.text(0.5, 0.07, coords, transform=ax.transAxes,
+                    color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
 
-        ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes,
-                color=THEME['text'], linewidth=1 * scale_factor, zorder=11)
+            ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes,
+                    color=THEME['text'], linewidth=1 * scale_factor, zorder=11)
 
-        # --- ATTRIBUTION (bottom right) ---
-        if FONTS:
-            font_attr = FontProperties(fname=FONTS['light'], size=8)
-        else:
-            font_attr = FontProperties(family='monospace', size=8)
+            # --- ATTRIBUTION (bottom right) ---
+            if FONTS:
+                font_attr = FontProperties(fname=FONTS['light'], size=8)
+            else:
+                font_attr = FontProperties(family='monospace', size=8)
 
-        ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
-                color=THEME['text'], alpha=0.5, ha='right', va='bottom',
-                fontproperties=font_attr, zorder=11)
+            ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
+                    color=THEME['text'], alpha=0.5, ha='right', va='bottom',
+                    fontproperties=font_attr, zorder=11)
 
     # 5. Save
     print(f"Saving to {output_file}...")
@@ -1031,13 +1082,15 @@ def create_poster(city, country, point, dist, output_file, output_format, width=
     if fmt == "png":
         save_kwargs["dpi"] = 300
 
-    plt.savefig(output_file, format=fmt, **save_kwargs)
+    with timer.track("saving"):
+        plt.savefig(output_file, format=fmt, **save_kwargs)
 
     plt.close()
     
     # Print the absolute path for programmatic capture
     print(f"OUTPUT_FILE: {os.path.abspath(output_file)}")
     print(f"✓ Done! Poster saved as {output_file}")
+    timer.print_summary(header="Timing summary", include_total=True)
 
 
 def print_examples():
@@ -1239,6 +1292,8 @@ Examples:
     print("City Map Poster Generator")
     print("=" * 50)
     
+    run_timer = StepTimer()
+
     # Get coordinates and generate poster
     try:
         # Determine which mode we're in
@@ -1259,20 +1314,25 @@ Examples:
             filename_base = args.city or "custom"
         else:
             # City/country geocoding mode
-            coords = get_coordinates(args.city, args.country)
+            with run_timer.track("coordinate lookup"):
+                coords = get_coordinates(args.city, args.country)
             place_name = None
             display_city = args.city_label or args.city
             display_country = args.country_label or args.country
             filename_base = args.city
         
         for theme_name in themes_to_generate:
-            THEME = load_theme(theme_name)
-            output_file = generate_output_filename(filename_base, theme_name, args.format, output_path=args.output)
-            create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name, natural_mode=args.natural, natural_detail=args.natural_detail, include_text=not args.no_text)
+            with run_timer.track(f"theme setup ({theme_name})"):
+                THEME = load_theme(theme_name)
+                output_file = generate_output_filename(filename_base, theme_name, args.format, output_path=args.output)
+            with run_timer.track(f"poster generation ({theme_name})"):
+                create_poster(display_city, display_country, coords, args.distance, output_file, args.format, args.width, args.height, country_label=args.country_label, place_name=place_name, natural_mode=args.natural, natural_detail=args.natural_detail, include_text=not args.no_text)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
         print("=" * 50)
+        if len(themes_to_generate) > 1:
+            run_timer.print_summary(header="Run summary", include_total=True)
         
     except Exception as e:
         print(f"\n✗ Error: {e}")
